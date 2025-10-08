@@ -1,0 +1,121 @@
+ssh -i ~/.ssh/san_98737196 opc@130.61.74.196
+
+Firewall-cmd and iptables
+
+Update the Firewall and IP Tables on the Instance
+--firewall-cmd - firewalld command line client
+
+sudo firewall-cmd --zone=public --add-port=8888/tcp --permanent
+
+sudo firewall-cmd --zone=public --add-port=8501/tcp --permanent
+
+sudo firewall-cmd --zone=public --add-port=1521/tcp --permanent
+
+--To apply the changes
+sudo firewall-cmd --reload
+
+
+--allow incoming TCP traffic on the ports through the iptables
+ firewall on a linux system:
+
+sudo iptables -A INPUT -p tcp --dport 8888 -j ACCEPT
+
+sudo iptables -A INPUT -p tcp --dport 8501 -j ACCEPT
+
+sudo iptables -A INPUT -p tcp --dport 1521 -j ACCEPT
+
+cd labs/
+
+source $HOME/.bashrc
+
+python --version
+
+tree $HOME/labs
+
+--https://ip4.me/ -- gets me the IP of local machine which is accessing the internet
+-- this IP is configured with the ingress rule for the ports 8888,8501,1521
+-- UNIX command -> curl ifconfig.me
+
+nohup jupyter-lab --no-browser --ip 0.0.0.0 --NotebookApp.token='' --NotebookApp.password='' --port 8888 &
+
+--access the jupyter instance from internet http://130.61.74.196:8888
+-- as  the ingress rule is defined at the subnet of compute instance
+-- public address OCI compute 130.61.74.196
+
+
+
+-- sudo lsof -i :8888
+#Component	Meaning
+#sudo	Superuser Do. This executes the command with root privileges. This is often necessary because lsof might need elevated permissions to see information about processes owned by other users or the operating system.
+#lsof	List Open Files. This is the core utility that lists all open files and the processes that opened them. In Unix-like systems, almost everything (including network connections) is treated as a file.
+#-i	Internet (or network) files. This option restricts the output to list only network file listings.
+#:8888	Port number. This is an additional filter that specifies the particular TCP or UDP port you are interested in. In this case, it restricts the output to processes that have a network connection (listening or established) on port 8888.
+
+
+----Oracle
+sudo podman run -d \
+    --name 23ai1 \
+    --network=host \
+    -e ORACLE_PWD=database123 \
+    -v /home/opc/oradata:/opt/oracle/oradata:z \
+    container-registry.oracle.com/database/free:latest
+
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') Checking if FREE (CDB root) is registered..."
+MAX_RETRIES=20
+for i in $(seq 1 $MAX_RETRIES); do
+  if sudo podman exec 23ai1 lsnrctl status | grep -q "FREE "; then
+    echo "$(date '+%Y-%m-%d %H:%M:%S') FREE service is registered with the listener."
+    break
+  fi
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [$i/$MAX_RETRIES] Waiting for FREE service..."
+  sleep 10
+done
+
+
+if ! sudo podman exec 23ai1 lsnrctl status | grep -q "FREEPDB1"; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') FREEPDB1 not registered after $MAX_RETRIES attempts. Forcing it open..."
+  sudo podman exec 23ai1 bash -lc "echo exit | sqlplus -S / as sysdba <<EOF
+  ALTER SYSTEM SET LOCAL_LISTENER = '(ADDRESS=(PROTOCOL=TCP)(HOST=127.0.0.1)(PORT=1521))' scope=both;
+  ALTER SYSTEM REGISTER;
+  ALTER PLUGGABLE DATABASE ALL OPEN;
+  ALTER PLUGGABLE DATABASE ALL SAVE STATE;
+  EXIT;
+EOF"
+  echo "$(date '+%Y-%m-%d %H:%M:%S') Forced FREEPDB1 open and saved state. Continuing setup..."
+fi
+
+
+echo "Configuring Oracle database in PDB (freepdb1)..."
+sudo podman exec -i 23ai1 bash <<EOF
+sqlplus -S / as sysdba <<EOSQL
+-- ensure PDB is open and switch context
+-- ALTER PLUGGABLE DATABASE FREEPDB1 OPEN IF NOT EXISTS;
+ALTER SESSION SET CONTAINER=FREEPDB1;
+CREATE BIGFILE TABLESPACE tbs2 DATAFILE 'bigtbs_f2.dbf' SIZE 1G AUTOEXTEND ON NEXT 32M MAXSIZE UNLIMITED EXTENT MANAGEMENT LOCAL SEGMENT SPACE MANAGEMENT AUTO;
+CREATE UNDO TABLESPACE undots2 DATAFILE 'undotbs_2a.dbf' SIZE 1G AUTOEXTEND ON RETENTION GUARANTEE;
+CREATE TEMPORARY TABLESPACE temp_demo TEMPFILE 'temp02.dbf' SIZE 1G REUSE AUTOEXTEND ON NEXT 32M MAXSIZE UNLIMITED EXTENT MANAGEMENT LOCAL UNIFORM SIZE 1M;
+CREATE USER vector IDENTIFIED BY vector DEFAULT TABLESPACE tbs2 QUOTA UNLIMITED ON tbs2;
+GRANT DB_DEVELOPER_ROLE TO vector;
+EXIT;
+EOSQL
+EOF
+
+
+echo "Switching to CDB root for system-level changes..."
+sudo podman exec -i 23ai1 bash <<EOF
+sqlplus -S / as sysdba <<EOSQL
+CREATE PFILE FROM SPFILE;
+ALTER SYSTEM SET vector_memory_size = 512M SCOPE=SPFILE;
+SHUTDOWN IMMEDIATE;
+STARTUP;
+-- Re-open PDBs after restart and save state again
+ALTER PLUGGABLE DATABASE ALL OPEN;
+ALTER PLUGGABLE DATABASE ALL SAVE STATE;
+ALTER SYSTEM REGISTER;
+EXIT;
+EOSQL
+EOF
+
+
+podman exec -i 23ai1 bash -lc "lsnrctl services"
